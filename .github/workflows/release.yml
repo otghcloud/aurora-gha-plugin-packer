@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_override:
+        description: Semantic version bump when version_override is empty
+        required: true
+        default: auto
+        type: choice
+        options: [auto, patch, minor, major]
+      version_override:
+        description: Optional explicit version without the v prefix; defaults to 1.0.0 for the first release
+        required: false
+        default: ''
+        type: string
+      release_title:
+        description: Title for the GitHub release
+        required: true
+        type: string
+
+concurrency:
+  group: release-aurora-gha-plugin-packer
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ['self-hosted', 'ubuntu-latest']
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Calculate version
+        id: version
+        env:
+          BUMP_OVERRIDE: ${{ inputs.bump_override }}
+          VERSION_OVERRIDE: ${{ inputs.version_override }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${VERSION_OVERRIDE}" ]]; then version="${VERSION_OVERRIDE#v}"; else
+            last_tag="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1)"
+            if [[ -z "${last_tag}" ]]; then version="1.0.0"; else
+            IFS=. read -r major minor patch <<< "${last_tag#v}"
+            case "${BUMP_OVERRIDE}" in major) major=$((major + 1)); minor=0; patch=0 ;; minor) minor=$((minor + 1)); patch=0 ;; patch|auto) patch=$((patch + 1)) ;; *) exit 1 ;; esac
+            version="${major}.${minor}.${patch}"
+            fi
+          fi
+          [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+      - name: Validate Composer package
+        run: composer validate --strict --no-check-publish
+      - name: Set up Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+        run: |
+          set -euo pipefail
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists; skipping release creation."
+            exit 0
+          fi
+          git tag -a "${TAG}" -m "${TAG} - ${RELEASE_TITLE}"
+          git push origin "${TAG}"
+          gh release create "${TAG}" --generate-notes --title "${RELEASE_TITLE}"
+      - name: Notify Packagist
+        env:
+          PACKAGIST_TOKEN: ${{ secrets.PACKAGIST_TOKEN }}
+          PACKAGIST_USERNAME: otghcloud
+          PACKAGIST_VCS_URL: https://github.com/otghcloud/aurora-gha-plugin-packer
+        run: |
+          set -euo pipefail
+          [[ -n "${PACKAGIST_TOKEN}" ]] || { echo 'PACKAGIST_TOKEN is required' >&2; exit 1; }
+          payload="{\"repository\":{\"url\":\"${PACKAGIST_VCS_URL}\"}}"
+          response_file="$(mktemp)"
+          trap 'rm -f "${response_file}"' EXIT
+          http_code="$(curl --silent --output "${response_file}" --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --url "https://packagist.org/api/update-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+            --data "${payload}")"
+          if [[ "${http_code}" == '200' || "${http_code}" == '202' ]]; then
+            exit 0
+          fi
+          if grep -Eqi 'not[ -]?found|does not exist|unknown package' "${response_file}"; then
+            http_code="$(curl --silent --output "${response_file}" --write-out '%{http_code}' \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --url "https://packagist.org/api/create-package?username=${PACKAGIST_USERNAME}&apiToken=${PACKAGIST_TOKEN}" \
+              --data "${payload}")"
+            if [[ "${http_code}" == '200' || "${http_code}" == '201' || "${http_code}" == '202' ]]; then
+              exit 0
+            fi
+          fi
+          cat "${response_file}" >&2
+          exit 1
