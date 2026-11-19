@@ -9,6 +9,7 @@ use App\Models\Builds\ImageBuild;
 use App\Models\Credentials\Credential;
 use App\Services\Builds\RunnerImagesLocator;
 use App\Services\Builds\TemplateCatalogEntry;
+use App\Services\Proxmox\ProxmoxClient;
 use Symfony\Component\Process\Process;
 
 final class PackerBuilder implements BuilderInterface
@@ -57,7 +58,7 @@ final class PackerBuilder implements BuilderInterface
     /** @return array<string, string> */
     private function buildEnvironment(ImageBuild $build, TemplateCatalogEntry $entry): array
     {
-        $variables = $this->environmentVariables($build);
+        $variables = $this->environmentVariables($build, $entry);
         $scriptsRoot = $this->runnerImages->scriptsRoot($entry);
 
         if ($scriptsRoot !== null) {
@@ -126,7 +127,7 @@ final class PackerBuilder implements BuilderInterface
     }
 
     /** @return array<string, string> */
-    private function environmentVariables(ImageBuild $build): array
+    private function environmentVariables(ImageBuild $build, TemplateCatalogEntry $entry): array
     {
         $account = $build->environment->githubAccount;
         $credential = $build->credentialSnapshot ?: $build->credential ?: Credential::query()
@@ -140,6 +141,7 @@ final class PackerBuilder implements BuilderInterface
         $template = $build->runnerTemplate;
         $targetNode = $build->proxmoxTarget;
         $mapping = $template->targetMappings()->whereKey($targetNode->id)->firstOrFail();
+        $isoFile = $this->resolveIsoFile($targetNode, $mapping, $entry);
         $variables = [
             'PKR_VAR_pmx_url' => $targetNode->proxmox_url,
             'PKR_VAR_pmx_node' => $targetNode->proxmox_node,
@@ -154,7 +156,7 @@ final class PackerBuilder implements BuilderInterface
             'PKR_VAR_ssh_username' => (string) $credential->username,
             'PKR_VAR_ssh_password' => (string) $credential->password,
             'PKR_VAR_ssh_public_key' => (string) $credential->public_key,
-            'PKR_VAR_pmx_iso_file' => (string) $mapping->pivot->build_iso_file,
+            'PKR_VAR_pmx_iso_file' => $isoFile,
             'PACKER_GITHUB_API_TOKEN' => (string) $account->github_token,
             'PKR_VAR_github_api_token' => (string) $account->github_token,
             'PACKER_PLUGIN_PATH' => config('builds.packer_plugin_path'),
@@ -175,5 +177,36 @@ final class PackerBuilder implements BuilderInterface
         }
 
         return $variables;
+    }
+
+    private function resolveIsoFile($targetNode, $mapping, TemplateCatalogEntry $entry): string
+    {
+        $isoFile = (string) $mapping->pivot->build_iso_file;
+
+        if ($isoFile !== '__auto__') {
+            if ($isoFile === '') {
+                throw new ProvisioningException('Select an installation ISO for '.$targetNode->name.'.');
+            }
+
+            return $isoFile;
+        }
+
+        $artifact = $entry->builder()['artifact'] ?? [];
+        $url = $artifact['url'] ?? null;
+        $filename = $artifact['file'] ?? (is_string($url) ? basename((string) parse_url($url, PHP_URL_PATH)) : null);
+
+        if (! is_string($url) || $url === '' || ! is_string($filename) || $filename === '' || $targetNode->build_iso_storage === null) {
+            throw new ProvisioningException('Automatic ISO selection is unavailable for '.$targetNode->name.'. Select an installation ISO manually.');
+        }
+
+        $proxmox = new ProxmoxClient($targetNode);
+
+        foreach ($proxmox->isoImages() as $image) {
+            if (str_ends_with($image['volid'], '/'.$filename)) {
+                return $image['volid'];
+            }
+        }
+
+        return $proxmox->downloadIso($targetNode->build_iso_storage, $url);
     }
 }
