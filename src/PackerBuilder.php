@@ -65,6 +65,10 @@ final class PackerBuilder implements BuilderInterface
             $variables['PKR_VAR_runner_images_root'] = $scriptsRoot;
         }
 
+        if ($entry->runnerDirectory() !== null) {
+            $variables['PKR_VAR_runner_directory'] = $entry->runnerDirectory();
+        }
+
         return $variables;
     }
 
@@ -145,8 +149,10 @@ final class PackerBuilder implements BuilderInterface
         $variables = [
             'PKR_VAR_pmx_url' => $targetNode->proxmox_url,
             'PKR_VAR_pmx_node' => $targetNode->proxmox_node,
-            'PKR_VAR_pmx_token_id' => (string) $targetNode->proxmox_token_id,
-            'PKR_VAR_pmx_token_secret' => (string) $targetNode->proxmox_token_secret,
+            'PKR_VAR_pmx_token_id' => $targetNode->usesPasswordAuth() ? '' : (string) $targetNode->proxmox_token_id,
+            'PKR_VAR_pmx_token_secret' => $targetNode->usesPasswordAuth() ? '' : (string) $targetNode->proxmox_token_secret,
+            'PKR_VAR_pmx_username' => $targetNode->usesPasswordAuth() ? (string) $targetNode->proxmox_username : '',
+            'PKR_VAR_pmx_password' => $targetNode->usesPasswordAuth() ? (string) $targetNode->proxmox_password : '',
             'PKR_VAR_pmx_iso_storage' => (string) $targetNode->build_iso_storage,
             'PKR_VAR_pmx_vm_storage' => (string) $targetNode->build_vm_storage,
             'PKR_VAR_pmx_template_vmid' => (string) ($build->template_vmid ?? $mapping->pivot->template_vmid),
